@@ -32,14 +32,15 @@ jobs:
         id: semver
         run: |
           latest_tag=${{ steps.get_latest_tag.outputs.latest_tag }}
-          # Remove 'v' prefix
+          # Remove 'v' prefix and split version
           version=${latest_tag#v}
-          # Split version into array
-          IFS='.' read -ra VERSION_PARTS <<< "$version"
+          major=$(echo $version | cut -d. -f1)
+          minor=$(echo $version | cut -d. -f2)
+          patch=$(echo $version | cut -d. -f3)
           # Increment patch version
-          ((VERSION_PARTS[2]++))
+          new_patch=$((patch + 1))
           # Construct new version
-          new_version="v${VERSION_PARTS[0]}.${VERSION_PARTS[1]}.${VERSION_PARTS[2]}"
+          new_version="v${major}.${minor}.${new_patch}"
           echo "new_version=${new_version}" >> $GITHUB_OUTPUT
 
   build:
