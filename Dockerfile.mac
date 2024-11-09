@@ -1,0 +1,27 @@
+FROM arm64v8/python:3.10-slim
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clone ComfyUI repository
+RUN git clone https://github.com/comfyanonymous/ComfyUI.git .
+
+# Install PyTorch for Mac ARM and other dependencies
+RUN pip3 install --no-cache-dir torch torchvision torchaudio
+RUN pip3 install -r requirements.txt
+
+# Expose port 8188 (default ComfyUI port)
+EXPOSE 8188
+
+# Set environment variable to allow external connections
+ENV PYTHONUNBUFFERED=1
+ENV LISTEN_PORT=8188
+ENV LISTEN_HOST=0.0.0.0
+
+# Command to run ComfyUI
+CMD ["python3", "main.py", "--listen", "--port", "8188", "--host", "0.0.0.0"]

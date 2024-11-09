@@ -1,0 +1,188 @@
+name: Build and Push Docker Images
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # First, determine the next version number
+  version:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    outputs:
+      new_version: ${{ steps.semver.outputs.new_version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get latest tag
+        id: get_latest_tag
+        run: |
+          latest_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "latest_tag=${latest_tag}" >> $GITHUB_OUTPUT
+
+      - name: Calculate next version
+        id: semver
+        run: |
+          latest_tag=${{ steps.get_latest_tag.outputs.latest_tag }}
+          # Remove 'v' prefix
+          version=${latest_tag#v}
+          # Split version into array
+          IFS='.' read -ra VERSION_PARTS <<< "$version"
+          # Increment patch version
+          ((VERSION_PARTS[2]++))
+          # Construct new version
+          new_version="v${VERSION_PARTS[0]}.${VERSION_PARTS[1]}.${VERSION_PARTS[2]}"
+          echo "new_version=${new_version}" >> $GITHUB_OUTPUT
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [version]
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      matrix:
+        platform:
+          - name: nvidia
+            dockerfile: Dockerfile.nvidia
+            platforms: linux/amd64,linux/arm64
+          - name: amd
+            dockerfile: Dockerfile.amd
+            platforms: linux/amd64,linux/arm64
+          - name: mac-arm
+            dockerfile: Dockerfile.mac-arm
+            platforms: linux/arm64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+            type=raw,value=${{ needs.version.outputs.new_version }},enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.platform.dockerfile }}
+          platforms: ${{ matrix.platform.platforms }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}-${{ matrix.platform.name }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  create-manifest:
+    needs: [build, version]
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    permissions:
+      packages: write
+
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push manifest list
+        run: |
+          # Get the SHA tag from the current commit
+          SHA_TAG=$(echo ${{ github.sha }} | cut -c1-12)
+
+          # Create manifest list for each tag pattern
+          for TAG in "main" "$SHA_TAG" "${{ needs.version.outputs.new_version }}"; do
+            docker manifest create \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG-nvidia \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG-amd \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG-mac-arm
+
+            # Add platform-specific annotations
+            docker manifest annotate \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG-nvidia \
+              --os linux --arch amd64
+            docker manifest annotate \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG-nvidia \
+              --os linux --arch arm64
+            docker manifest annotate \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG-amd \
+              --os linux --arch amd64
+            docker manifest annotate \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG-amd \
+              --os linux --arch arm64
+            docker manifest annotate \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG-mac-arm \
+              --os linux --arch arm64
+
+            # Push the manifest list
+            docker manifest push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG
+          done
+
+  create-release:
+    needs: [create-manifest, version]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create ${{ needs.version.outputs.new_version }} \
+            --title "Release ${{ needs.version.outputs.new_version }}" \
+            --notes "## Docker Images
+
+          - NVIDIA: \`ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.new_version }}-nvidia\`
+          - AMD: \`ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.new_version }}-amd\`
+          - Mac ARM: \`ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.new_version }}-mac-arm\`
+
+          ## Supported Architectures
+
+          - NVIDIA: linux/amd64, linux/arm64
+          - AMD: linux/amd64, linux/arm64
+          - Mac ARM: linux/arm64"
